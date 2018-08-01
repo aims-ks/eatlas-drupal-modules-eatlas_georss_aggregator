@@ -1,0 +1,231 @@
+<?php
+// TODO Add a configuration option to choose the default GeoRSS input format (filtered_html)
+
+/**
+ * Modify the aggregator_feed table to add fields for the added checkboxes.
+ * .install file documentation: https://drupal.org/node/51220
+ */
+
+/**
+ * HOWTO Change a field length:
+ *     1. Create temporary field
+ *     2. Copy data from the bad field to the temporary field
+ *         INSERT INTO field_data_field_link_tmp SELECT * FROM field_data_field_ea_rss_link;
+ *         INSERT INTO field_revision_field_link_tmp SELECT * FROM field_revision_field_ea_rss_link;
+ *     3. Clear cache and verify
+ *     4. Delete all instances of the bad field
+ *     5. Create the good field (with same ID)
+ *     6. Copy data from temporary field to good field
+ *         INSERT INTO field_data_field_ea_rss_link SELECT * FROM field_data_field_link_tmp;
+ *         INSERT INTO field_revision_field_ea_rss_link SELECT * FROM field_revision_field_link_tmp;
+ *     7. Clear cache and verify
+ *     8. Delete temporary field
+ */
+
+/**
+ * Implement: hook_install
+ * Add DB columns to the table aggregator_feed, to hold the value of the
+ *     new fields added by:
+ *     eatlas_georss_aggregator_form_aggregator_form_feed_alter
+ *         - Feed support "from" date parameter (checkbox)
+ *         - Save items as node (checkbox)
+ * Add a new content type "eatlas_georss_item" for RSS and GEO RSS items,
+ *     used when the "Save items as node" checkbox is checked.
+ * NOTE: This hook is only called when the module is installed for the
+ *     first time, or re-installed after been disabled and uninstalled.
+ */
+function eatlas_georss_aggregator_install() {
+	// Add aggregator_feed.eatlas_support_from_date DB field
+	try {
+		db_query('ALTER TABLE {aggregator_feed} ADD eatlas_support_from_date BOOLEAN');
+	} catch (Exception $e) {
+		watchdog('eatlas_georss_aggregator', 'Could not create DB column aggregator_feed.eatlas_support_from_date', array(), WATCHDOG_WARNING);
+	}
+
+	// Add aggregator_feed.eatlas_georss DB field
+	try {
+		db_query('ALTER TABLE {aggregator_feed} ADD eatlas_save_as_node BOOLEAN');
+	} catch (Exception $e) {
+		watchdog('eatlas_georss_aggregator', 'Could not create DB column aggregator_feed.eatlas_save_as_node', array(), WATCHDOG_WARNING);
+	}
+
+	// Add node type eatlas_georss_item
+	node_types_rebuild();
+	$types = node_type_get_types();
+	node_add_body_field($types['eatlas_georss_item']);
+	_eatlas_georss_aggregator_add_custom_fields();
+
+	// Disable comments for this content type (can be re-enable using "Structure > Content types")
+	variable_set('comment_eatlas_georss_item', 0);
+}
+
+function _eatlas_georss_aggregator_add_custom_fields() {
+	foreach (_eatlas_georss_aggregator_node_fields() as $field) {
+		field_create_field($field);
+	}
+	foreach (_eatlas_georss_aggregator_node_fields() as $fieldinstance) {
+		$fieldinstance['entity_type'] = 'node';
+		$fieldinstance['bundle'] = 'eatlas_georss_item';
+		field_create_instance($fieldinstance);
+	}
+}
+
+/*
+mysql> DESCRIBE aggregator_item;
++-------------+--------------+------+-----+---------+----------------+
+| Field       | Type         | Null | Key | Default | Extra          |
++-------------+--------------+------+-----+---------+----------------+
+| iid         | int(11)      | NO   | PRI | NULL    | auto_increment |
+| fid         | int(11)      | NO   | MUL | 0       |                |
+| title       | varchar(255) | NO   |     |         |                |
+| link        | text         | NO   |     | NULL    |                |
+| author      | varchar(255) | NO   |     |         |                |
+| description | longtext     | NO   |     | NULL    |                |
+| timestamp   | int(11)      | YES  |     | NULL    |                |
+| guid        | text         | NO   |     | NULL    |                |
++-------------+--------------+------+-----+---------+----------------+
+*/
+
+/**
+ * Configuration of the fields defined in node type "eatlas_georss_item".
+ * It's used by the install method (file: eatlas_georss_aggregator.install)
+ * To avoid massive code duplication, this method describe the fields
+ * and the fields' instance at once.
+ */
+function _eatlas_georss_aggregator_node_fields() {
+	// Field API: https://api.drupal.org/api/drupal/modules!field!field.module/group/field/7
+	// Form API reference: https://api.drupal.org/api/drupal/developer!topics!forms_api_reference.html/7
+	// NOTE: Field name max length = 32 characters (max 12 for the RSS field name)
+	return array(
+		EATLAS_GEORSS_FIELD_PREFIX.'link' => array(
+			'field_name' => EATLAS_GEORSS_FIELD_PREFIX.'link',
+			'label' => t('Link'),
+			'type' => 'text',
+			'settings' => array(
+				'max_length' => 2048,
+			),
+			'widget' => array(
+				'type' => 'text_textfield'
+			)
+		),
+		EATLAS_GEORSS_FIELD_PREFIX.'author' => array(
+			'field_name' => EATLAS_GEORSS_FIELD_PREFIX.'author',
+			'label' => t('Author'),
+			'type' => 'text',
+			'widget' => array(
+				'type' => 'text_textfield'
+			)
+		),
+
+		EATLAS_GEORSS_FIELD_PREFIX.'pubdate' => array(
+			'field_name' => EATLAS_GEORSS_FIELD_PREFIX.'pubdate',
+			'label' => t('Publication date'),
+			'type' => 'datetime',
+			'widget' => array(
+				'type' => 'date_popup'
+			)
+		),
+		EATLAS_GEORSS_FIELD_PREFIX.'lastupdate' => array(
+			'field_name' => EATLAS_GEORSS_FIELD_PREFIX.'lastupdate',
+			'label' => t('Last update'),
+			'type' => 'datetime',
+			'widget' => array(
+				'type' => 'date_popup'
+			)
+		),
+
+		// TODO Add GeoRSS reference fields - Need GeoRSS example
+
+		// Business logic fields - Locked
+		EATLAS_GEORSS_FIELD_PREFIX.'guid' => array(
+			'field_name' => EATLAS_GEORSS_FIELD_PREFIX.'guid',
+			'description' => t('Unique ID of the feed item, has sent by the RSS feed. This value is used to avoid duplication of RSS item and manage updates.<br/><strong>WARNING:</strong> Modifying this value may have unexpected result.'),
+			'label' => t('GUID'),
+			'type' => 'text',
+			// Can not be deleted
+			'locked' => TRUE,
+			'widget' => array(
+				'type' => 'text_textfield'
+			)
+		),
+
+		// NOTE: We can NOT rely on the node dates since the node may
+		//     get modified from the admin, to setup the branding for example.
+		EATLAS_GEORSS_FIELD_PREFIX.'timestamp' => array(
+			'field_name' => EATLAS_GEORSS_FIELD_PREFIX.'timestamp',
+			'description' => t('Automatically generated timestamp, representing the time when the record was harvested.<br/><strong>WARNING:</strong> Modifying this value may have unexpected result.'),
+			'label' => t('Timestamp'),
+			'type' => 'text',
+			// Can not be deleted
+			'locked' => TRUE,
+			'widget' => array(
+				'type' => 'text_textfield'
+			)
+		),
+
+		EATLAS_GEORSS_FIELD_PREFIX.'fid' => array(
+			'field_name' => EATLAS_GEORSS_FIELD_PREFIX.'fid',
+			'description' => t('The ID of the feed which harvested this item.<br/><strong>WARNING:</strong> Modifying this value may have unexpected result.'),
+			'label' => t('Feed ID'),
+			'type' => 'text',
+			// Can not be deleted
+			'locked' => TRUE,
+			'widget' => array(
+				'type' => 'text_textfield'
+			)
+		)
+	);
+}
+
+/**
+ * Implement: hook_uninstall
+ * NOTE: This hook is only called when the module is disabled then uninstalled (using the uninstall tab in the module configuration page).
+ */
+function eatlas_georss_aggregator_uninstall() {
+	try {
+		db_query('ALTER TABLE {aggregator_feed} DROP eatlas_support_from_date');
+	} catch (Exception $e) {
+		watchdog('eatlas_georss_aggregator', 'Could not delete DB column aggregator_feed.eatlas_support_from_date', array(), WATCHDOG_WARNING);
+	}
+
+	try {
+		db_query('ALTER TABLE {aggregator_feed} DROP eatlas_save_as_node');
+	} catch (Exception $e) {
+		watchdog('eatlas_georss_aggregator', 'Could not delete DB column aggregator_feed.eatlas_save_as_node', array(), WATCHDOG_WARNING);
+	}
+
+
+	// Uninstall the node type
+
+	// Gather all the example content that might have been created while this
+	// module was enabled.  Simple selects still use db_query().
+	// api.drupal.org/api/function/db_query/7
+	$results = db_select('node', 'n')
+			->fields('n', array('nid'))
+			->condition('type', 'eatlas_georss_item', '=')
+			->execute();
+	$nids = array();
+	foreach ($results as $row) {
+		$nids[] = $row->nid;
+	}
+
+	// Delete all the nodes at once
+	// api.drupal.org/api/function/node_delete_multiple/7
+	node_delete_multiple($nids);
+
+	// Delete our content type
+	// api.drupal.org/api/function/node_type_delete/7
+	node_type_delete('eatlas_georss_item');
+
+	// Purge all field information
+	// api.drupal.org/api/function/field_purge_batch/7
+	field_purge_batch(10);
+
+	// Clear cache - "Structure > Content types" do not list but "Add content" still list
+	drupal_flush_all_caches();
+
+	// Clear variables
+	variable_del('comment_eatlas_georss_item');
+}
+
+?>

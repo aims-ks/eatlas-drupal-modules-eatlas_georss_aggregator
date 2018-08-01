@@ -1,0 +1,736 @@
+<?php
+/**
+ * This module add checkboxes in the feed edition form. When the module
+ * is enabled, new aggregator settings are availabled in
+ * admin/config/services/aggregator/settings:
+ *     When the eAtlas fetcher is used and the feed has the
+ *         "Feed support "from" date parameter" checked, the URL is
+ *         augmented with a "from" date parameter.
+ *     When the eAtlas processor is used, the feed items are saved as nodes.
+ *         When the feed has the "Save items as node" checked, the GeoRSS items
+ *         are saved into a GeoRSS node.
+ */
+
+// *IMPORTANT* Field name length is limited to 32 characters.
+//     Longer this prefix is, less characters are left for the field name,
+//     therefore the RSS item tag name.
+define('EATLAS_GEORSS_FIELD_PREFIX', 'field_ea_rss_');
+
+// Date format used for RSS feed requests.
+//     http://php.net/manual/en/function.date.php
+// r = RFC 2822 formatted date
+//     Example: 'Thu, 21 Dec 2000 16:01:07 +0200'
+define('EATLAS_GEORSS_DATE_FORMAT', 'r');
+
+module_load_include('inc', 'eatlas_georss_aggregator', 'includes/eatlas_georss_aggregator.admin');
+
+// Implement: hook_views_api
+// Define the view used by this module.
+// The view show a list of feed item for a given feed id (in parameter)
+function eatlas_georss_aggregator_views_api() {
+	return array(
+		'api' => 3.0,
+		// The "views" module will check on that folder for a file named "eatlas_georss_aggregator.views.inc".
+		'path' => drupal_get_path('module', 'eatlas_georss_aggregator') . '/includes'
+	);
+}
+
+// NOTE about saving feed items into nodes: I don't want to use the Feeds
+//     module. It's huge (780 kb) and the only version available is in Alpha.
+//     It seems overkill to use that module simply to load feed items as nodes. I can simply hardcode
+//     the feeds fields in this module and have it working within a few kb.
+//         Feeds module: https://drupal.org/project/feeds
+
+// Aggregator API: https://api.drupal.org/api/drupal/modules!aggregator!aggregator.api.php/7
+
+/**
+ * Implement: hook_menu_alter
+ * Change the aggregator page callback, to display proper item
+ * count when the items are nodes instead of aggregator_items.
+ */
+function eatlas_georss_aggregator_menu_alter(&$items) {
+	$items['admin/config/services/aggregator']['page callback'] = 'eatlas_georss_aggregator_admin_overview';
+	// NOTE: We can not change the 'file' parameter because the file has
+	//     to be located in the module that created the menu ('aggregator')
+	//     Which mean that the file has to be included using 'module_load_include'.
+	// $items['admin/config/services/aggregator']['file'] = 'includes/eatlas_georss_aggregator.admin.inc';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter.
+ * Modify the rss feed edit form to add 2 checkboxes.
+ *     [ ] Support "from" parameter
+ *     [ ] Save items as node
+ */
+function eatlas_georss_aggregator_form_aggregator_form_feed_alter(&$form, &$form_state, $form_id) {
+	// Grab the saved values from the DB
+	$supportFromDate = FALSE;
+	$saveAsNode = FALSE;
+	if (isset($form['fid']['#value'])) {
+		$fid = $form['fid']['#value'];
+		$result = db_query(
+				'SELECT eatlas_support_from_date, eatlas_save_as_node FROM {aggregator_feed} WHERE fid = :fid',
+				array(':fid' => $fid))->fetchAssoc();;
+
+		if ($result) {
+			$supportFromDate = $result['eatlas_support_from_date'];
+			$saveAsNode = $result['eatlas_save_as_node'];
+		}
+	}
+
+	$form['eatlas_georss_support_from_date'] = array(
+		'#type' => 'checkbox',
+		'#title' => t('Feed support "from" date parameter'),
+		'#default_value' => $supportFromDate,
+		'#description' => 'Check this box if the feed support the "from" date parameter.<br/>'.
+				'NOTE: If the feed support it, the system will be able to harvest all missing RSS items and will use a lot less bandwidth.'
+	);
+	$form['eatlas_georss_save_as_node'] = array(
+		'#type' => 'checkbox',
+		'#title' => t('Save items as node'),
+		'#default_value' => $saveAsNode,
+		'#description' => 'Check this box if you want the items to be saved as node. '.
+				'This is important for GeoRSS feeds and regionalised feeds, to apply proper branding on its items.<br/>'.
+				'<strong>IMPORTANT:</strong> Delete and update items after changing this option.'
+	);
+	$form['#submit'][] = '_eatlas_georss_aggregator_form_submit';
+}
+function _eatlas_georss_aggregator_form_submit($form, &$form_state) {
+	$fid = $form_state['values']['fid'];
+
+	// Grab the values of the checkboxes
+	$supportFromDate = $form_state['values']['eatlas_georss_support_from_date'];
+	$saveAsNode = $form_state['values']['eatlas_georss_save_as_node'];
+
+	db_update('aggregator_feed')
+		->condition('fid', $fid)
+			->fields(array(
+				'eatlas_support_from_date' => $supportFromDate,
+				'eatlas_save_as_node' => $saveAsNode
+			))
+			->execute();
+}
+
+// Implements: hook_aggregator_fetch_info
+function eatlas_georss_aggregator_aggregator_fetch_info() {
+	return array(
+		'title' => t('eAtlas GeoRSS fetcher'),
+		'description' => t('eAtlas fetcher for feeds that support the "from" URL parameter.'),
+	);
+}
+
+// Implements: hook_aggregator_fetch
+function eatlas_georss_aggregator_aggregator_fetch($feed) {
+	$old_url = FALSE;
+	if (isset($feed->eatlas_support_from_date) && $feed->eatlas_support_from_date) {
+		$from = _eatlas_georss_aggregator_latest_modif_date($feed->fid);
+		$old_url = $feed->url;
+		$feed->url = url($feed->url, array('query' => array('from' => $from)));
+	}
+
+	// Continue with the normal Drupal behaviour
+	module_load_include('inc', 'aggregator', 'aggregator.fetcher');
+	$result = aggregator_aggregator_fetch($feed);
+
+	// Restore the feed URL
+	if ($old_url !== FALSE) {
+		$feed->url = $old_url;
+	}
+
+	return $result;
+}
+
+// NOTE: We can NOT rely on the node dates since the node may
+//     get modified from the admin, to setup the branding for example.
+function _eatlas_georss_aggregator_latest_modif_date($fid) {
+	$query = db_select('field_data_'.EATLAS_GEORSS_FIELD_PREFIX.'timestamp', 't');
+	$query->fields('t', array(EATLAS_GEORSS_FIELD_PREFIX.'timestamp_value'));
+	$query->condition('t.entity_type', 'node', '=');
+	$query->condition('t.bundle', 'eatlas_georss_item', '=');
+	$query->condition('t.deleted', 0, '=');
+	$query->leftJoin('field_data_'.EATLAS_GEORSS_FIELD_PREFIX.'fid', 'f', 'f.entity_id = t.entity_id AND f.bundle = t.bundle AND f.entity_type = t.entity_type AND f.deleted = 0');
+	$query->condition('f.'.EATLAS_GEORSS_FIELD_PREFIX.'fid_value', $fid, '=');
+	$query->orderBy(EATLAS_GEORSS_FIELD_PREFIX.'timestamp_value', 'DESC');
+	$timestamp = $query->execute()->fetchField();
+
+	return date(EATLAS_GEORSS_DATE_FORMAT, $timestamp);
+}
+
+// Implements: hook_aggregator_process_info
+function eatlas_georss_aggregator_aggregator_process_info() {
+	return array(
+		'title' => t('eAtlas GeoRSS processor'),
+		'description' => t('Creates GEO-referenced nodes of feed items.')
+	);
+}
+
+// Implements: hook_aggregator_process
+function eatlas_georss_aggregator_aggregator_process($feed) {
+	if (is_object($feed)) {
+		if ($feed->eatlas_save_as_node) {
+			if (is_array($feed->items)) {
+				$entities_not_found = array();
+
+				foreach ($feed->items as $item) {
+					// Save this item. Try to avoid duplicate entries as much as possible. If
+					// we find a duplicate entry, we resolve it and pass along its ID is such
+					// that we can update it if needed.
+					$entry = NULL;
+					if (!empty($item['guid'])) {
+						$query = db_select('field_data_'.EATLAS_GEORSS_FIELD_PREFIX.'guid', 'g');
+						$query->fields('g', array('entity_id'));
+						$query->condition('g.entity_type', 'node', '=');
+						$query->condition('g.bundle', 'eatlas_georss_item', '=');
+						$query->condition('g.'.EATLAS_GEORSS_FIELD_PREFIX.'guid_value', $item['guid'], '=');
+						$query->leftJoin('field_data_'.EATLAS_GEORSS_FIELD_PREFIX.'fid', 'f', 'f.entity_id = g.entity_id AND f.bundle = g.bundle AND f.entity_type = g.entity_type AND f.deleted = 0');
+						$query->condition('f.'.EATLAS_GEORSS_FIELD_PREFIX.'fid_value', $feed->fid, '=');
+						$entry = $query->execute()->fetchObject();
+					}
+
+					// Set the feed id (fid)
+					$item['fid'] = $feed->fid;
+
+					// Set the item id (nid) if we are in edit mode
+					$item['nid'] = ($entry && property_exists($entry, 'entity_id') ? $entry->entity_id : '');
+
+					_eatlas_georss_aggregator_save_item($item, $entities_not_found);
+				}
+
+				// Log entities (persons) that could not be found during the harvest
+				if (!empty($entities_not_found)) {
+					$msg = "<strong>Entities not found</strong><ul>\n";
+					foreach($entities_not_found as $value => $entities_info) {
+						$msg .= "<li>\n";
+						$msg .= "Entity: <strong>$value</strong><br/>\n";
+						$msg .= 'Types: ' . $entities_info['types'] . "<br/>\n";
+						$msg .= "Nodes:<ul>\n";
+						foreach($entities_info['nodes'] as $node_title) {
+							$msg .= "<li><em>$node_title</em></li>\n";
+						}
+						$msg .= "</ul>\n";
+						$msg .= "</li>\n";
+					}
+					$msg .= "</ul>\n";
+					watchdog('eatlas_georss_aggregator', $msg);
+				}
+			}
+		} else {
+			// Normal behaviour: Drupal save the feed items as 'aggregator_item' instead of nodes
+			module_load_include('inc', 'aggregator', 'aggregator.processor');
+			aggregator_aggregator_process($feed);
+		}
+	}
+}
+
+function _eatlas_georss_aggregator_save_item($edit, &$entities_not_found) {
+	$node = NULL;
+	if (!empty($edit['nid'])) {
+		$node = node_load($edit['nid']);
+	}
+
+	if (!$node) {
+		if (!empty($edit['title'])) {
+
+			// ### INSERT ###
+
+			// Create a new node
+			// https://drupal.org/node/1388922
+			$node = new stdClass();
+			$node->type = 'eatlas_georss_item'; // bundle
+
+			// Sets some defaults. Invokes hook_prepare() and hook_node_prepare().
+			node_object_prepare($node);
+
+			// Setup node instance config
+			// RSS items are in unknown language.
+			$node->language = LANGUAGE_NONE;
+			$node->status = 1; // Published
+			$node->promote = 1; // Promote to front page by default
+			$node->comment = 0; // 0 = comments disabled, 1 = read only, 2 = read/write
+
+			// Setup fields value
+			_eatlas_georss_aggregator_set_georss_node_values($node, $edit, $entities_not_found);
+
+			// Prepares node for saving by populating author and creation date.
+			$node = node_submit($node);
+
+			// Save the node
+			node_save($node);
+		}
+	} else {
+		if (empty($edit['title'])) {
+
+			// ### DELETE ###
+
+			// Delete the node when the item found in the RSS feed
+			// has a GUID but no title.
+			// For node deletion when the admin has clicked the
+			// "remove items" link, see:
+			//     eatlas_georss_aggregator_aggregator_remove
+
+			node_delete($node->nid);
+
+		} else {
+
+			// ### UPDATE ###
+
+			_eatlas_georss_aggregator_set_georss_node_values($node, $edit, $entities_not_found);
+
+			// Save the node
+			node_save($node);
+
+		}
+	}
+}
+
+function _eatlas_georss_aggregator_set_georss_node_values($node, $edit, &$entities_not_found) {
+	// Get Geo RSS fields
+	$node_fields = field_info_instances('node', 'eatlas_georss_item');
+
+	// Set the node title
+	// This field name do not start with EATLAS_GEORSS_FIELD_PREFIX so
+	// it is not be automatically processed with the for loop.
+	// The title do not have max_length settings, it's hardcoded to 255.
+	$node->title = truncate_utf8($edit['title'], 255, TRUE, TRUE);
+
+	// TODO Add a config for the default GeoRSS input format!
+	$body_format = 'filtered_html';
+	if (!filter_format_exists($body_format)) {
+		$body_format = filter_fallback_format();
+	}
+
+	// Set the node body
+	// This field name do not start with EATLAS_GEORSS_FIELD_PREFIX so
+	// it is not be automatically processed with the for loop.
+	if (!isset($node->body[$node->language][0])) {
+		$node->body[$node->language][0] = array();
+	}
+	$node->body[$node->language][0]['value'] = $edit['description'];
+	$node->body[$node->language][0]['format'] = $body_format;
+
+	foreach ($node_fields as $field_name => $field_config) {
+		// if ($field_name starts with 'field_ea_rss_')
+		$prefix_length = strlen(EATLAS_GEORSS_FIELD_PREFIX);
+		if (substr($field_name, 0, $prefix_length) === EATLAS_GEORSS_FIELD_PREFIX) {
+			$rss_field_name = substr($field_name, $prefix_length);
+			$values = NULL;
+			if ($rss_field_name === 'timestamp') {
+				// Set the timestamp, used to find the latest update date
+				// (the feed item update date may not represent the reality,
+				// which is why we are using a generated timestamp)
+				$values = REQUEST_TIME;
+			} else {
+				if (isset($edit[$rss_field_name])) {
+					$field_info = field_info_field($field_name);
+					if (isset($field_info['type'])) {
+						switch ($field_info['type']) {
+							case 'text':
+								//$max_length = $field_info['settings']['max_length'];
+								//$values = truncate_utf8($edit[$rss_field_name], $max_length, TRUE, TRUE);
+								$values = _eatlas_georss_aggregator_get_text_values($field_info, trim($edit[$rss_field_name]));
+								break;
+							case 'datetime':
+								$values = _eatlas_georss_aggregator_to_drupal_datetime(trim($edit[$rss_field_name]));
+								break;
+							case 'node_reference':
+								$values = _eatlas_georss_aggregator_get_node_reference_values($field_info, trim($edit[$rss_field_name]), $entities_not_found, $node);
+								break;
+							default:
+								// 'type' for the body is 'text_with_summary'
+								$values = $edit[$rss_field_name];
+								break;
+						}
+					} else {
+						// NOTE: This is not supposed to happen...
+						$values = $edit[$rss_field_name];
+					}
+				}
+			}
+
+			// Reset the field value
+			$node->{$field_name}[$node->language] = array();
+			// Fill the field with the new values
+			if (!empty($values)) {
+				if (!is_array($values)) {
+					$values = array(array('value' => $values));
+				}
+				$node->{$field_name}[$node->language] = $values;
+			}
+		}
+	}
+
+	// Set specific eAtlas fields (feed categories => branding, related links => projects)
+	_eatlas_georss_aggregator_set_branding($node);
+	_eatlas_georss_aggregator_set_projects($node);
+}
+
+function _eatlas_georss_aggregator_get_text_values($field_info, $raw_values) {
+	$returnValues = $raw_values;
+	if ($raw_values) {
+		$max_length = NULL;
+		if (isset($field_info['settings']['max_length'])) {
+			$max_length = $field_info['settings']['max_length'];
+		}
+
+		if (isset($field_info['cardinality']) && $field_info['cardinality'] !== '1') {
+			// Multiple values
+			$returnValues = array();
+			$values = explode(';', $raw_values);
+
+			if ($field_info['cardinality'] > 0) {
+				// Multiple values (limited)
+				for ($i=0, $len=max($field_info['cardinality'], count($values)); $i<$len; $i++) {
+					$value = trim($values[$i]);
+					if ($value) {
+						if ($max_length) {
+							$value = truncate_utf8($value, $max_length, TRUE, TRUE);
+						}
+						$returnValues[] = array('value' => $value);
+					}
+				}
+			} else {
+				// Multiple values (infinite)
+				for ($i=0, $len=count($values); $i<$len; $i++) {
+					$value = trim($values[$i]);
+					if ($value) {
+						if ($max_length) {
+							$value = truncate_utf8($value, $max_length, TRUE, TRUE);
+						}
+						$returnValues[] = array('value' => $value);
+					}
+				}
+			}
+		} else {
+			// Single value
+			if ($max_length) {
+				$returnValues = truncate_utf8($raw_values, $max_length, TRUE, TRUE);
+			}
+		}
+	}
+
+	return $returnValues;
+}
+
+// NOTE: The $node is for better debugging only
+// TODO Check $field_info['cardinality']
+function _eatlas_georss_aggregator_get_node_reference_values($field_info, $raw_values, &$entities_not_found, $node = NULL) {
+	$valuesFound = array();
+	if ($raw_values) {
+		if (isset($field_info['settings']['referenceable_types'])) {
+
+			$values = explode(';', $raw_values);
+
+			// Find the related node types (in the setting of the field)
+			$node_types = array();
+			foreach($field_info['settings']['referenceable_types'] as $node_type => $selected) {
+				if ($selected) {
+					$node_types[] = $node_type;
+				}
+			}
+
+			// Load related the nodes
+			$nodes = entity_load('node', FALSE, array('type' => $node_types)); // TODO Condition is Deprecated!!
+			foreach($values as $value) {
+				$value = trim($value);
+				$foundNode = NULL;
+				// This step is specific to GeoNetwork
+				// If the "node_types" array contains the node type 'persons',
+				// we split the name on coma (,) to get "Last name" and "First name"
+				// (ignoring the person's title), then we construct a name using the
+				// "First name" and "Last name" which should match the name format
+				// in the eAtlas.
+				// Otherwise, we simply try to find the give string.
+				if (in_array('person', $node_types)) {
+					$name_parts = explode(',', $value);
+					if (count($name_parts) >= 2) {
+						$last_name = trim($name_parts[0]);
+						$first_name = trim($name_parts[1]);
+
+						$foundNode = eatlas_commons_get_entity_by_alias("$first_name $last_name", $nodes);
+					}
+				}
+
+				if (!$foundNode) {
+					$foundNode = eatlas_commons_get_entity_by_alias($value, $nodes);
+				}
+
+				if ($foundNode) {
+					$valuesFound[] = array(
+						'nid' => $foundNode->nid
+					);
+				} else {
+					// NOTE: nid can not be used here since the node hasn't been created yet.
+					if (!isset($entities_not_found[$value])) {
+						$entities_not_found[$value] = array(
+							'types' => print_r($node_types, TRUE),
+							'nodes' => array()
+						);
+					}
+					if (property_exists($node, 'title')) {
+						$entities_not_found[$value]['nodes'][] = $node->title;
+					}
+				}
+			}
+		} else {
+			watchdog('eatlas_georss_aggregator', "Invalid field settings for field: " . $field_info['field_name']);
+		}
+	}
+
+	return $valuesFound;
+}
+
+function _eatlas_georss_aggregator_set_branding($node) {
+	// Categories => Branding
+	// 1. Categories only contains 1 branding
+	//     => The unique branding is used for the default branding
+	// 2. Categories contains 2 brandings, including the eAtlas branding
+	//     => Use the specific branding (not the eAtlas) as default branding
+	// 3. Categories contains 2 or more brandings, not including the eAtlas
+	//     => Use any of the 2 branding as the default one
+	// 4. Categories contains more than 2 brandings, including the eAtlas branding
+	//     => Use eAtlas as default branding
+
+	// Needed fields:
+	//     $node->field_ea_rss_categories
+	//     $node->field_branding
+	//     $node->field_supported_brandings
+	if (module_exists('eatlas_branding')) {
+		$eAtlas_branding_id = array('tid' => EATLAS_BRANDING_DEFAULT_BRANDING_ID);
+
+		$supported_brandings_value = array();
+		$default_branding = NULL;
+
+		if (property_exists($node, 'field_ea_rss_categories')) {
+			$categories_field = field_get_items('node', $node, 'field_ea_rss_categories');
+
+			// Find the supported branding - Feed categories which match the name of a branding
+			foreach ($categories_field as $categories_raw_value) {
+				if (isset($categories_raw_value['value'])) {
+					$categories_value = str_replace('_', ' ', $categories_raw_value['value']);
+					$branding_id = eatlas_branding_get_branding_id_from_name($categories_value);
+					if ($branding_id) {
+						$supported_brandings_value[] = array('tid' => $branding_id);
+					}
+				}
+			}
+
+			if (!empty($supported_brandings_value)) {
+				// Find the default branding
+
+				// This is the default, for when we have
+				// * only one supported branding
+				// * more than 2 supported brandings (with no support for eAtlas)
+				$default_branding = $supported_brandings_value[0];
+
+				if (count($supported_brandings_value) === 2) {
+					// There is 2 supported brandings - the default is the first one that is not eAtlas
+					foreach ($supported_brandings_value as $branding_id) {
+						if ($branding_id !== $eAtlas_branding_id) {
+							$default_branding = $branding_id;
+						}
+					}
+				} elseif (count($supported_brandings_value) > 2 && in_array($eAtlas_branding_id, $supported_brandings_value)) {
+					// There is more than 2 supported brandings - the default is eAtlas if supported, otherwise it's the the first one int he array
+					$default_branding = $eAtlas_branding_id;
+				}
+			}
+		}
+
+		if (empty($supported_brandings_value)) {
+			$supported_brandings_value[] = $eAtlas_branding_id;
+		}
+
+		if ($default_branding === NULL) {
+			$default_branding = $supported_brandings_value[0];
+		}
+
+		// Save the branding values
+		$node->field_supported_brandings = array(
+			LANGUAGE_NONE => $supported_brandings_value
+		);
+		$node->field_branding = array(
+			LANGUAGE_NONE => array(
+				$default_branding
+			)
+		);
+	}
+}
+
+function _eatlas_georss_aggregator_set_projects($node) {
+	// Needed fields:
+	//     $node->field_ea_rss_relatedlinks
+	//     $node->field_project ?
+	if (property_exists($node, 'field_ea_rss_relatedlinks')) {
+		$related_links_field = field_get_items('node', $node, 'field_ea_rss_relatedlinks');
+		$related_links_value = array();
+		foreach ($related_links_field as $related_links_raw_value) {
+			$project_id = _eatlas_georss_aggregator_get_project_id_from_url($related_links_raw_value['value']);
+			if ($project_id !== NULL) {
+				$related_links_value[] = array('nid' => $project_id);
+			}
+		}
+
+		if (!empty($related_links_value)) {
+			$node->field_project = array(
+				LANGUAGE_NONE => $related_links_value
+			);
+		}
+	}
+}
+
+/**
+ * Grab the "path" of the URL (what come after the domain name)
+ * and try to find a node associated with in the Drupal site.
+ * Since the path is the only thing which is checked, there is
+ * a slight chance that a URL from an other website has a path
+ * which correspond to a project of this website, but the probability
+ * is low enough to take the chance.
+ */
+function _eatlas_georss_aggregator_get_project_id_from_url($url) {
+	$url_parts = parse_url($url);
+
+	// Project URLs has a URL path
+	if (!isset($url_parts['path']) || !$url_parts['path']) {
+		return NULL;
+	}
+
+	// The most obvious cases has been filtered out.
+
+	// Lets see if Drupal can resolve the URL to an internal URL
+	$url_drupal_path = drupal_lookup_path('source', ltrim($url_parts['path'], '/'));
+	if (!$url_drupal_path) {
+		return NULL;
+	}
+
+	// Resolve the path node ID
+	if (arg(0, $url_drupal_path) !== 'node') {
+		return NULL;
+	}
+	$nid = arg(1, $url_drupal_path);
+
+	// Check if the node exists and if it's a project
+	$node = node_load($nid);
+	if (!$node || $node->type !== 'project') {
+		return NULL;
+	}
+
+	return $nid;
+}
+
+/**
+ * Convert a valid date to a format supported by Drupal (GMT).
+ * NOTE: If the input date is invalid, this function will return a valid date but maybe not
+ *     what you would expect.
+ *     For example:
+ *         Input (invalid: the 10th of May 2014 was NOT a Tuesday):
+ *             "Tue, 10 May 2014 12:00:00 EST"
+ *         Will return something like:
+ *             "2014-05-14 03:00:00"
+ */
+function _eatlas_georss_aggregator_to_drupal_datetime($date_str) {
+	// There is many ways to achieve this:
+	// * Using "DateTime" object
+	//     This method do not automatically convert timezone
+	//     (but it's easy to manually set it, locally):
+	//         $date_obj = new DateTime($date_str);
+	//         $date_obj->setTimezone(new DateTimeZone('GMT'));
+	//         return $date_obj->format("Y-m-d H:i:s");
+	// * Using "date_parse" function
+	//     Everything has to be done manualy with this method:
+	//         $date_arr = date_parse($date_str);
+	//         // Do some manual timezone convertion...
+	//         return $date_arr['year'] . '-' . $date_arr['month'] . '-' . $date_arr['day'] ...;
+	// * Using "strtotime" function
+	//     Automatically convert the date to the current timezone
+	//     (the timezone has to be changed system wide to produce a date in GMT):
+	//         $timestamp = strtotime($date_str);
+	//         return date("Y-m-d H:i:s", $timestamp);
+
+	$date_obj = new DateTime($date_str);
+	$date_obj->setTimezone(new DateTimeZone('GMT'));
+	return $date_obj->format("Y-m-d H:i:s");
+}
+
+// Implements: hook_aggregator_remove
+// Called when the admin click the "remove items" link.
+// This will remove ALL items from the feed.
+function eatlas_georss_aggregator_aggregator_remove($feed) {
+	// dbo_limit = Limit of items that can be deleted at once.
+	// I can not find this value anywhere.
+	// Reduce the value if you get the following error:
+	//     General error: 1 too many SQL variables.
+	// For more info, see:
+	//     https://api.drupal.org/api/drupal/modules%21node%21node.module/function/node_delete_multiple/7
+	$dbo_limit = 100;
+
+	// Counter to avoid infinite loop (extra protection)
+	$loop_count = 0;
+	$loop_limit = 10000;
+
+	if (is_object($feed)) {
+		// NOTE: We don't check for "$feed->eatlas_save_as_node"
+		//     since this settings may have changed since the last
+		//     feed update.
+		//     Instead, we delete all nodes AND rss items associated
+		//     with that feed.
+
+		// Delete nodes associated with the feed, if any.
+		$nids = NULL;
+		do {
+			$query = db_select('field_data_'.EATLAS_GEORSS_FIELD_PREFIX.'fid', 'f');
+			$query->fields('f', array('entity_id'));
+			$query->condition('f.'.EATLAS_GEORSS_FIELD_PREFIX.'fid_value', $feed->fid, '=');
+			$query->range(0, $dbo_limit);
+			$nids = $query->execute()->fetchCol();
+
+			if (!empty($nids)) {
+				// NOTE: node_delete_multiple can delete a bunch of node at,
+				//     once, but it will crash if too many nodes are deleted.
+				//     It's safer to delete them one by one...
+
+				// NOTE: The eatlas_georss_aggregator_node_delete hook
+				//     take care of removing entries in eatlas_georss_item.
+				node_delete_multiple($nids);
+			}
+
+			// Extra protection against infinite loop.
+			// Unlikely to occurred.
+			$loop_count++;
+			if ($loop_count > $loop_limit) {
+				watchdog('eatlas_georss_aggregator', 'ERROR: Infinite loop detected in eatlas_georss_aggregator_aggregator_remove!', array(), WATCHDOG_ERROR);
+				return;
+			}
+		} while (!empty($nids));
+
+		// Normal behaviour - Delete rss_items (the default ones) if any.
+		module_load_include('inc', 'aggregator', 'aggregator.processor');
+		aggregator_aggregator_remove($feed);
+	}
+}
+
+
+
+// Define the "eAtlas GeoRSS item" node type
+// http://www.sitepoint.com/creating-a-new-drupal-node-type/
+
+/**
+ * Implements hook_node_info().
+ */
+function eatlas_georss_aggregator_node_info() {
+	return array(
+		'eatlas_georss_item' => array(
+			'name' => t('eAtlas GeoRSS item'),
+			'base' => 'node_content', // Needed to be displayed within "Structure > Content types"
+			'description' => t('Node type used for any type of RSS feed item, including GeoRSS. '.
+					'To harvest a field, simply add it in this node type, using '.
+					'"'.EATLAS_GEORSS_FIELD_PREFIX.'<field name>" as machine name. '.
+					'Replace <field name> with the name of the field in the RSS feed, in lowercase. '.
+					'Any other field added manually will stay untouched.'),
+
+			// Allow the user to modify the node type (add / remove fields)
+			'locked' => FALSE
+		)
+	);
+}
+
+?>

@@ -1,0 +1,19 @@
+; $Id$
+name = eAtlas GeoRSS aggregator
+description = [eatlas_georss_aggregator] GeoRSS Feed aggregator. This aggregator try to request the RSS feed using "from" parameter, to request all and only the items that has been modified / created since the specified date.
+core = 7.x
+
+files[] = eatlas_georss_aggregator.module
+files[] = eatlas_georss_aggregator.admin.inc
+
+package = eAtlas
+
+dependencies[] = eatlas_commons
+dependencies[] = aggregator
+dependencies[] = views
+
+; Attributes used by the update module.
+; There fields needs to be removed if the module is migrated to Drupal.org
+project status url = "http://drupal.eatlas.org.au/modules/eatlas"
+version = "7.x-1.1"
+project = "eatlas_georss_aggregator"
